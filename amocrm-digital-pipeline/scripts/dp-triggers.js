@@ -179,6 +179,9 @@ async () => {
         } else if (t.action === "change_status") {
           trigger.moves_to = { pipeline_id: Number(s.pipe_id), status_id: Number(s.status_id), name: stageNames[`${s.pipe_id}:${s.status_id}`] || SYSTEM_STAGES[s.status_id] || null };
         }
+        // Широкий триггер стоит сразу на нескольких этапах: в данных он один, под первым этапом.
+        const span = (Array.isArray(t.statuses) ? t.statuses : []).filter((id) => String(id) !== String(statusId));
+        if (span.length) trigger.also_on_stages = span.map((id) => ({ status_id: Number(id), stage: stages[String(id)] || SYSTEM_STAGES[id] || null }));
         if (t.action === "create_task") {
           // Срок задачи (deadline) — не задержка триггера (delay_sec): не путать.
           trigger.task = {
