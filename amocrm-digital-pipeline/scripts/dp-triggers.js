@@ -14,7 +14,9 @@
 //   delay                — задержка в секундах,
 //   conditions_groups    — условия «для всех сделок, у которых…»,
 //   settings             — настройки действия (у Sensei: settings.widget.settings.process_id).
-// Там же data.statuses[].forward_events — события этапа («входящее письмо → в этот этап»).
+// Там же: data.statuses[] — события этапа (forward_events) и подсказки (descriptions);
+// data.lead_sources, unsorted, duplication_control, scoring — левая колонка настройки;
+// data.custom_task_types, chat_sources, element_custom_fields — справочники для названий.
 //
 // Это внутреннее устройство интерфейса amoCRM, а не обещанный API: после обновления amoCRM
 // разметка может измениться. Скрипт тогда не соврёт, а скажет в problems, что блок не найден.
@@ -52,7 +54,7 @@ async () => {
   };
 
   // Настройки без пустых значений и служебного шума: то, что отличает один триггер от другого.
-  const NOISE = new Set(["is_trial_expired", "relative_date", "task_created", "field_value_changed", "change_in_related", "optional_conditions", "widget_info", "button_id"]);
+  const NOISE = new Set(["is_trial_expired", "relative_date", "task_created", "field_value_changed", "optional_conditions", "widget_info", "button_id"]);
   const clean = (v, depth = 0) => {
     if (v === null || v === undefined || v === "" || v === false) return undefined;
     if (typeof v === "string") return v.length > 300 ? v.slice(0, 300) + "…" : v;
@@ -70,6 +72,9 @@ async () => {
     }
     return Object.keys(out).length ? out : undefined;
   };
+
+  // Источники чата приходят то списком id, то списком объектов.
+  const listOrIds = (v) => (Array.isArray(v) ? v : Object.values(v || {})).map((x) => (x && typeof x === "object" ? x.id : x)).filter((x) => x !== undefined && x !== null && x !== "");
 
   const readConditions = (t) =>
     (Array.isArray(t.conditions_groups) ? t.conditions_groups : Object.values(t.conditions_groups || {})).map((g) => ({
@@ -89,7 +94,13 @@ async () => {
   const stageNames = {};
   for (const p of pipelines) for (const s of p._embedded.statuses || []) stageNames[`${p.id}:${s.id}`] = `${p.name} → ${s.name}`;
 
-  const out = { account: location.hostname, read_at: new Date().toISOString(), pipelines: [], triggers: [], stage_events: [], problems: [] };
+  const out = { account: location.hostname, read_at: new Date().toISOString(), pipelines: [], triggers: [], stage_events: [], stage_hints: [], warnings: [], problems: [] };
+
+  // Справочники страницы бывают и списком, и объектом по id; название лежит в name, option или title.
+  const listOf = (v) => (Array.isArray(v) ? v : Object.values(v || {})).filter((x) => x && typeof x === "object");
+  const nameOf = (x) => (x && (x.name || x.option || x.title)) || undefined;
+  const lookup = (dict, id) => nameOf(listOf(dict).find((x) => String(x.id) === String(id)));
+  const STANDARD_TASK_TYPES = { 1: "Связаться", 2: "Встреча" };
 
   for (const p of pipelines) {
     const stages = Object.fromEntries((p._embedded.statuses || []).map((s) => [String(s.id), s.name]));
@@ -102,8 +113,21 @@ async () => {
       continue;
     }
     // «Входящее письмо / звонок / заход на сайт / чат → перевести сделку в этап»: включённые события этапов.
-    const stageList = Array.isArray(params.data.statuses) ? params.data.statuses : Object.values(params.data.statuses || {});
+    const data = params.data;
+    const fields = data.element_custom_fields || {};
+    const fieldKnown = (id) => Object.keys(fields).length === 0 || Object.hasOwn(fields, String(id));
+    const sources = listOf(data.lead_sources);
+    const panel = {
+      lead_sources: sources.length,
+      lead_source_names: sources.map((x) => nameOf(x) || x.origin_name).filter(Boolean).slice(0, 60),
+      unsorted_enabled: Boolean(data.unsorted && data.unsorted.enabled),
+      duplication_control_enabled: Boolean(data.duplication_control && data.duplication_control.enabled),
+      scoring_enabled: Boolean(data.scoring && data.scoring.enabled),
+    };
+    const stageList = listOf(data.statuses);
     for (const st of stageList) {
+      const hints = listOf(st.descriptions).map((h) => ({ level: h.level, text: clean(h.description) })).filter((h) => h.text);
+      if (hints.length) out.stage_hints.push({ pipeline_id: p.id, pipeline: p.name, status_id: Number(st.id), stage: stages[String(st.id)] || st.option || null, hints });
       for (const ev of Object.values((st && st.forward_events) || {})) {
         if (!ev || !Number(ev.enabled)) continue;
         out.stage_events.push({ pipeline_id: p.id, pipeline: p.name, status_id: Number(st.id), stage: stages[String(st.id)] || st.option || null, event_id: ev.id, event: ev.name, settings: clean(ev.settings) });
@@ -133,6 +157,18 @@ async () => {
           delay_sec: Number(t.delay) || 0,
           conditions: conditions.length ? conditions : undefined,
         };
+        // Уточнения события: в каких источниках чата, входящим или любым сообщением и т. п.
+        const { id: _eid, event_id: _ev, name: _en, hidden_cool_down: _hc, ...eventRest } = t.execution_condition || {};
+        const eventOptions = clean(eventRest);
+        if (eventOptions) trigger.event_options = eventOptions;
+        const chatIds = [...new Set([...(listOrIds(t.execution_condition && t.execution_condition.chat_sources)), ...(listOrIds(t.conditions && t.conditions.chat_sources))])];
+        if (chatIds.length) trigger.chat_sources = chatIds.map((id) => ({ id, name: lookup(data.chat_sources, id) }));
+        // «Только в рабочее время», точная дата, повтор — когда заданы.
+        const workTime = clean(t.work_time);
+        if (workTime || t.work_time_id) trigger.work_time = workTime || { id: t.work_time_id };
+        if (t.date_exec && t.date_exec !== "0") trigger.date_exec = t.date_exec;
+        const recurrent = clean(t.recurrent);
+        if (recurrent) trigger.recurrent = recurrent;
         if (sensei) {
           trigger.sensei = {
             process_id: Number(w.process_id),
@@ -143,11 +179,30 @@ async () => {
         } else if (t.action === "change_status") {
           trigger.moves_to = { pipeline_id: Number(s.pipe_id), status_id: Number(s.status_id), name: stageNames[`${s.pipe_id}:${s.status_id}`] || SYSTEM_STAGES[s.status_id] || null };
         }
+        if (t.action === "create_task") {
+          // Срок задачи (deadline) — не задержка триггера (delay_sec): не путать.
+          trigger.task = {
+            type_id: s.task_type,
+            type: lookup(data.custom_task_types, s.task_type) || STANDARD_TASK_TYPES[s.task_type] || undefined,
+            text: s.task_text || undefined,
+            deadline: s.deadline || undefined,
+            responsible: s.user_name || s.responsible_user || undefined,
+          };
+        }
         if (!sensei) trigger.settings = clean(s);
+        // Мёртвые ссылки: триггер пишет в поле или проверяет поле, которого на странице уже нет.
+        const usedFields = [
+          ...listOf(s.fields).map((f) => f.field_id),
+          ...conditions.filter((c) => c.type === "custom_field" && c.field_id !== undefined).map((c) => c.field_id),
+        ].filter((id) => id !== undefined && id !== "");
+        for (const id of [...new Set(usedFields.map(String))]) {
+          if (!fieldKnown(id)) out.warnings.push({ trigger_id: t.id, pipeline: p.name, stage: trigger.stage, row: trigger.row, action: t.action, warning: `поле ${id} не найдено среди полей аккаунта: возможно, удалено` });
+        }
         out.triggers.push(trigger);
       }
     }
-    out.pipelines.push({ pipeline_id: p.id, name: p.name, stages: Object.keys(stages).length, triggers: count });
+    out.pipelines.push({ pipeline_id: p.id, name: p.name, stages: Object.keys(stages).length, triggers: count, ...panel });
+    if (data.triggers_count !== undefined) out.amocrm_triggers_count = data.triggers_count;
   }
 
   const byAction = {};
@@ -157,6 +212,6 @@ async () => {
   for (const line of out.triggers.map((t) => `${t.trigger_id}:${t.status_id}:${t.row}:${t.action}:${t.delay_sec}`).sort()) {
     for (let i = 0; i < line.length; i++) print = (print * 31 + line.charCodeAt(i)) >>> 0;
   }
-  out.summary = { triggers: out.triggers.length, sensei: out.triggers.filter((t) => t.sensei).length, stage_events: out.stage_events.length, by_action: byAction, fingerprint: print };
+  out.summary = { triggers: out.triggers.length, sensei: out.triggers.filter((t) => t.sensei).length, stage_events: out.stage_events.length, stage_hints: out.stage_hints.length, warnings: out.warnings.length, by_action: byAction, fingerprint: print };
   return out;
 };
